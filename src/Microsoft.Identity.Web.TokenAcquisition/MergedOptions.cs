@@ -477,6 +477,43 @@ namespace Microsoft.Identity.Web
                     int indexVersion = authoritySpan.Slice(indexTenant + 1).IndexOf('/');
                     int indexEndOfTenant = indexVersion == -1 ? authoritySpan.Length : indexVersion + indexTenant + 1;
 
+                    // dSTS authorities have the shape https://{host}/dstsv2/{tenantGuid}, i.e. TWO
+                    // path segments rather than the AAD-style single segment. The literal "dstsv2"
+                    // is part of the instance and the SECOND path segment is the tenant.
+                    // Without this branch the generic AAD parser below would treat "dstsv2" as the
+                    // tenant and silently drop the actual tenant GUID, producing an authority that
+                    // MSAL rejects ("The DSTS authority URI should have at least 2 segments...").
+                    // This mirrors the existing B2C "/tfp/" special case in PrepareAuthorityInstanceForMsal.
+                    // Note: literal "dstsv2" is intentionally inlined rather than promoted to a
+                    // Constants entry to keep this fix internal-API-clean (no InternalAPI.txt churn
+                    // across all target frameworks). It only appears in this one parser branch.
+                    ReadOnlySpan<char> firstPathSegment = authoritySpan.Slice(indexTenant + 1, indexEndOfTenant - indexTenant - 1);
+                    if (firstPathSegment.Equals("dstsv2".AsSpan(), StringComparison.OrdinalIgnoreCase))
+                    {
+                        // indexEndOfTenant points at the '/' (or end-of-string) right after "dstsv2".
+                        // Tenant is the next path segment.
+                        int indexAfterDsts = indexEndOfTenant + 1;
+                        if (indexAfterDsts <= authoritySpan.Length)
+                        {
+                            int relIndexAfterTenant = indexAfterDsts >= authoritySpan.Length
+                                ? -1
+                                : authoritySpan.Slice(indexAfterDsts).IndexOf('/');
+                            int indexEndOfDstsTenant = relIndexAfterTenant == -1
+                                ? authoritySpan.Length
+                                : indexAfterDsts + relIndexAfterTenant;
+
+                            mergedOptions.Instance = mergedOptions.PreserveAuthority
+                                ? mergedOptions.Authority!
+                                : authoritySpan.Slice(0, indexEndOfTenant).ToString();   // "https://{host}/dstsv2"
+                            mergedOptions.TenantId = mergedOptions.PreserveAuthority
+                                ? null
+                                : (indexAfterDsts < authoritySpan.Length
+                                    ? authoritySpan.Slice(indexAfterDsts, indexEndOfDstsTenant - indexAfterDsts).ToString()
+                                    : string.Empty);
+                            return;
+                        }
+                    }
+
                     // In CIAM and B2C, customers will use "authority", not Instance and TenantId
                     mergedOptions.Instance = mergedOptions.PreserveAuthority ? mergedOptions.Authority! : authoritySpan.Slice(0, indexTenant).ToString();
                     mergedOptions.TenantId = mergedOptions.PreserveAuthority ? null : authoritySpan.Slice(indexTenant + 1, indexEndOfTenant - indexTenant - 1).ToString();

@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Identity.Abstractions;
 using Microsoft.Identity.Client;
+using Microsoft.Identity.Web.Test.Common;
 using Microsoft.Identity.Web.Test.Common.Mocks;
 using Microsoft.Identity.Web.TestOnly;
 using Xunit;
@@ -27,6 +28,11 @@ namespace Microsoft.Identity.Web.Test
     ///   3. Send <c>x5c</c> in the client_assertion JWT header when <c>SendX5C=true</c>
     ///      (required for dSTS certificate-based authentication).
     ///
+    /// All tests use the natural / documented dSTS configuration form — a single
+    /// <see cref="MicrosoftIdentityApplicationOptions.Authority"/> string of the shape
+    /// <c>https://{host}/dstsv2/{tenantGuid}</c> — so they exercise the dSTS branch of
+    /// <c>MergedOptions.ParseAuthorityIfNecessary</c> end-to-end.
+    ///
     /// These tests use the existing <see cref="MockHttpClientFactory"/> infrastructure to mock
     /// the dSTS token endpoint, so no network/Key Vault/real certificate is required and the
     /// tests can run in any CI environment.
@@ -34,13 +40,24 @@ namespace Microsoft.Identity.Web.Test
     [Collection(nameof(TokenAcquirerFactorySingletonProtection))]
     public class DstsTokenAcquisitionTests
     {
-        // Vanilla dSTS authority format: https://{host}/dstsv2/{tenantGuid}
-        private const string DstsHost = "co2agg04-passive-dsts.dsts.core.azure-test.net";
-        private const string DstsTenantId = "7a433bfc-2514-4697-b467-e0933190487f";
+        // Vanilla dSTS authority: https://{host}/dstsv2/{tenantGuid}
+        // NOTE: all values below are synthetic placeholders for unit-test purposes only.
+        // They do not correspond to any real Microsoft / Azure / dSTS deployment, tenant,
+        // or application registration.
+        private const string DstsHost = "fake-dsts.test.invalid";
+        private const string DstsTenantId = "00000000-0000-0000-0000-000000000001";
         private const string DstsAuthority = "https://" + DstsHost + "/dstsv2/" + DstsTenantId;
         private const string DstsTokenEndpoint = DstsAuthority + "/oauth2/v2.0/token";
-        private const string DstsClientId = "8af3ec05-4d5b-4c0f-9c9a-3c6d3a3b2a6e";
-        private const string DstsScope = "https://dsts.core.azure-test.net/.default";
+
+        // NOTE: each test uses a distinct ClientId so that they get distinct MSAL app token
+        // caches. MSAL's confidential-client app token cache is keyed by ClientId/Authority and
+        // is preserved across TokenAcquirerFactory resets, which would otherwise cause a token
+        // acquired by one test to be served (from cache) to another test that registered a
+        // different mock HTTP handler — making mock handlers unused and Dispose assertions fail.
+        private const string DefaultDstsClientId = "00000000-0000-0000-0000-00000000c11d";
+        private const string DstsScope = "https://" + DstsHost + "/.default";
+
+        private static string NewDstsClientId() => Guid.NewGuid().ToString();
 
         /// <summary>
         /// Verifies that for a vanilla dSTS authority Id.Web/MSAL POSTs the client_credentials
@@ -51,7 +68,7 @@ namespace Microsoft.Identity.Web.Test
         public async Task GetAccessTokenForApp_DstsAuthority_PostsToDstsTokenEndpointAsync()
         {
             // Arrange
-            var tokenAcquirerFactory = InitDstsTokenAcquirerFactoryWithSecret();
+            var tokenAcquirerFactory = InitDstsTokenAcquirerFactoryWithSecret(NewDstsClientId());
             IServiceProvider serviceProvider = tokenAcquirerFactory.Build();
             var mockHttpClient = serviceProvider.GetRequiredService<IMsalHttpClientFactory>() as MockHttpClientFactory;
 
@@ -81,7 +98,8 @@ namespace Microsoft.Identity.Web.Test
         public async Task GetAccessTokenForApp_DstsAuthority_SendsClientCredentialsGrantAsync()
         {
             // Arrange
-            var tokenAcquirerFactory = InitDstsTokenAcquirerFactoryWithSecret();
+            string clientId = NewDstsClientId();
+            var tokenAcquirerFactory = InitDstsTokenAcquirerFactoryWithSecret(clientId);
             IServiceProvider serviceProvider = tokenAcquirerFactory.Build();
             var mockHttpClient = serviceProvider.GetRequiredService<IMsalHttpClientFactory>() as MockHttpClientFactory;
 
@@ -91,7 +109,7 @@ namespace Microsoft.Identity.Web.Test
                 {
                     { "grant_type", "client_credentials" },
                     { "scope", DstsScope },
-                    { "client_id", DstsClientId },
+                    { "client_id", clientId },
                     { "client_secret", "someSecret" },
                 }));
 
@@ -116,12 +134,13 @@ namespace Microsoft.Identity.Web.Test
         public async Task GetAccessTokenForApp_DstsAuthority_SecondCallUsesCacheAsync()
         {
             // Arrange
-            var tokenAcquirerFactory = InitDstsTokenAcquirerFactoryWithSecret();
+            var tokenAcquirerFactory = InitDstsTokenAcquirerFactoryWithSecret(NewDstsClientId());
             IServiceProvider serviceProvider = tokenAcquirerFactory.Build();
             var mockHttpClient = serviceProvider.GetRequiredService<IMsalHttpClientFactory>() as MockHttpClientFactory;
 
             // Register exactly ONE token-endpoint handler.
-            mockHttpClient!.AddMockHandler(MockHttpCreator.CreateClientCredentialTokenHandler());
+            var tokenHandler = MockHttpCreator.CreateClientCredentialTokenHandler();
+            mockHttpClient!.AddMockHandler(tokenHandler);
 
             IAuthorizationHeaderProvider authorizationHeaderProvider =
                 serviceProvider.GetRequiredService<IAuthorizationHeaderProvider>();
@@ -133,8 +152,14 @@ namespace Microsoft.Identity.Web.Test
             // Assert
             Assert.Equal("Bearer header.payload.signature", first);
             Assert.Equal(first, second);
-            // MockHttpClientFactory.Dispose asserts the queue is empty — i.e. the single handler
-            // was consumed exactly once, proving the second call did not hit the network.
+
+            // The single handler MUST have been consumed by the first call.
+            Assert.NotNull(tokenHandler.ActualRequestMessage);
+
+            // And the second call MUST have come from MSAL's app token cache: if it had hit the
+            // network, MockHttpClientFactory would have thrown ("no more mock handlers")
+            // because we only registered one. Additionally, MockHttpClientFactory.Dispose
+            // asserts that the queue is empty (i.e. exactly the one handler was consumed).
         }
 
         /// <summary>
@@ -145,7 +170,7 @@ namespace Microsoft.Identity.Web.Test
         public async Task GetAccessTokenForApp_DstsAuthority_TokenEndpointError_ThrowsMsalServiceExceptionAsync()
         {
             // Arrange
-            var tokenAcquirerFactory = InitDstsTokenAcquirerFactoryWithSecret();
+            var tokenAcquirerFactory = InitDstsTokenAcquirerFactoryWithSecret(NewDstsClientId());
             IServiceProvider serviceProvider = tokenAcquirerFactory.Build();
             var mockHttpClient = serviceProvider.GetRequiredService<IMsalHttpClientFactory>() as MockHttpClientFactory;
 
@@ -248,18 +273,21 @@ namespace Microsoft.Identity.Web.Test
         // ---- helpers ----
 
         /// <summary>
-        /// Builds a <see cref="TokenAcquirerFactory"/> configured for vanilla dSTS, using the
-        /// full dSTS Authority (no Instance/TenantId split since dSTS authorities don't follow
-        /// the AAD <c>Instance + TenantId</c> convention) and a client secret.
+        /// Builds a <see cref="TokenAcquirerFactory"/> configured for vanilla dSTS using the
+        /// natural single-string <see cref="MicrosoftIdentityApplicationOptions.Authority"/>
+        /// configuration (the form shown in dSTS documentation), with a client secret credential.
         /// </summary>
-        private static TokenAcquirerFactory InitDstsTokenAcquirerFactoryWithSecret()
+        private static TokenAcquirerFactory InitDstsTokenAcquirerFactoryWithSecret(string? clientId = null)
         {
+            string effectiveClientId = clientId ?? DefaultDstsClientId;
             TokenAcquirerFactoryTesting.ResetTokenAcquirerFactoryInTest();
             TokenAcquirerFactory tokenAcquirerFactory = TokenAcquirerFactory.GetDefaultInstance();
             tokenAcquirerFactory.Services.Configure<MicrosoftIdentityApplicationOptions>(options =>
             {
+                // dSTS authority — single string. Id.Web's MergedOptions.ParseAuthorityIfNecessary
+                // recognises the "/dstsv2/{guid}" shape and routes through MSAL's dSTS authority.
                 options.Authority = DstsAuthority;
-                options.ClientId = DstsClientId;
+                options.ClientId = effectiveClientId;
                 options.ClientCredentials = new[]
                 {
                     new CredentialDescription
@@ -280,14 +308,15 @@ namespace Microsoft.Identity.Web.Test
         /// (self-signed) certificate credential. The mock HTTP handler does not validate the
         /// certificate, so a self-signed cert is sufficient for unit tests.
         /// </summary>
-        private static TokenAcquirerFactory InitDstsTokenAcquirerFactoryWithCertificate(bool sendX5C)
+        private static TokenAcquirerFactory InitDstsTokenAcquirerFactoryWithCertificate(bool sendX5C, string? clientId = null)
         {
+            string effectiveClientId = clientId ?? NewDstsClientId();
             TokenAcquirerFactoryTesting.ResetTokenAcquirerFactoryInTest();
             TokenAcquirerFactory tokenAcquirerFactory = TokenAcquirerFactory.GetDefaultInstance();
             tokenAcquirerFactory.Services.Configure<MicrosoftIdentityApplicationOptions>(options =>
             {
                 options.Authority = DstsAuthority;
-                options.ClientId = DstsClientId;
+                options.ClientId = effectiveClientId;
                 options.SendX5C = sendX5C;
                 options.ClientCredentials = new[]
                 {
